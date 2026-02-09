@@ -3,7 +3,7 @@ from datetime import date
 from typing import List,Optional,Any
 from uuid import UUID,uuid4
 
-from litestar import Litestar,get,post,put,Controller
+from litestar import Litestar,get,post,put,Controller,patch
 from litestar.di import Provide
 from litestar.dto import DataclassDTO,DTOConfig
 from litestar.openapi.config import OpenAPIConfig
@@ -21,11 +21,13 @@ from sqlalchemy.orm import DeclarativeBase,Mapped,mapped_column,relationship
 from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
 import os
+from litestar.exceptions import ValidationException
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+#schema
 class Book(base.UUIDBase):
     title: Mapped[str]
     author: Mapped[str]
@@ -43,12 +45,14 @@ class ReadingLog(base.UUIDBase):
     notes: Mapped[str | None]
 
 
+#Repo
 class BookRepository(repository.SQLAlchemyAsyncRepository[Book]):
     model_type = Book
 
 class LogRepository(repository.SQLAlchemyAsyncRepository[ReadingLog]):
     model_type = ReadingLog
 
+#Dto
 class BookWriteDTO(SQLAlchemyDTO[Book]):
     config = DTOConfig(
         exclude={"id", "logs"},  
@@ -58,11 +62,12 @@ class BookReadDTO(SQLAlchemyDTO[Book]):
     pass
 
 class LogWriteDTO(SQLAlchemyDTO[ReadingLog]):
-    config = DTOConfig(exclude={"id","book"})
+    config = DTOConfig(exclude={"id","book","book_id"})
 
 class LogReadDTO(SQLAlchemyDTO[ReadingLog]):
-    config = DTOConfig()
+    config = DTOConfig(exclude={"book"})
 
+#Dependencies injection
 async def provide_book_repo(db_session: Any) -> BookRepository:
     return BookRepository(session=db_session)
 
@@ -91,31 +96,50 @@ class ReadingLogController(Controller):
     dependencies = {"repo": Provide(provide_log_repo)}
 
     @post(dto=LogWriteDTO, return_dto=LogReadDTO)
-    async def log_progress(self,data:ReadingLog,repo: LogRepository) -> ReadingLog:
+    async def add_log_progress(self,data:ReadingLog,repo: LogRepository) -> ReadingLog:
+
+        if data.finish_date and data.finish_date > date.today():
+            raise ValidationException(detail="Finish date cannot be in the future.")
+        
+        if data.finish_date and data.finish_date < data.start_date:
+            raise ValidationException(detail="Finish date cannot be earlier than the start date.")
+        
         res = await repo.add(data)
         await repo.session.commit()
         await repo.session.refresh(res)
         return res
     
     
-    @get("/stats")
-    async def get_stats(self,repo: LogRepository) -> dict:
-        current_year = date.today().year
+    @get("/{book_id:uuid}/stats",dto=None)
+    async def get_book_stats(self,repo: LogRepository,book_id: UUID) -> dict[str,Any]:
+        stmt = select(ReadingLog).where(ReadingLog.book_id==book_id).order_by(ReadingLog.start_date.desc())
+        result = await repo.session.execute(stmt)
+        latest_log = result.scalars().first()
 
-        read_stmt = select(func.count(ReadingLog.id)).where(
-            func.extract("year",ReadingLog.finish_date) == current_year
-        )
-        avg_stmt = select(func.avg(ReadingLog.rating))
+        if not latest_log:
+            return {"status":"Not Started","last_update":None}
+        if latest_log.finish_date:
+            return {"status":"Finished","last_update":latest_log.finish_date}
+        
+        return {"status":"Currently Reading","last_update":latest_log.start_date}
 
-        read_count = await repo.session.execute(read_stmt)
 
-        avg_rating = await repo.session.execute(avg_stmt)
+    @patch("/{log_id:uuid}",dto=LogWriteDTO,return_dto=LogReadDTO)
+    async def update_log(self,data:ReadingLog,repo: LogRepository,log_id: UUID) -> ReadingLog:
+        existing_log = await repo.get(log_id)
 
-        return {
-            "books_read_this_year":read_count.scalar() or 0,
-            "avg_rating":round(float(avg_rating.scalar() or 0),2),
-        }
+        updated_log = await repo.update(data,item_id=log_id)
 
+        if updated_log.finish_date and updated_log.finish_date > date.today():
+            raise ValidationException(detail="Finish date cannot be in the future.")
+        
+        if updated_log.finish_date and updated_log.finish_date < updated_log.start_date:
+            raise ValidationException(detail="Finish date cannot be earlier than the start date.")
+        
+        await repo.session.commit()
+        await repo.session.refresh(updated_log)
+        return updated_log
+    
 db_config = SQLAlchemyAsyncConfig(
     connection_string=DATABASE_URL,
     # before_send_handler=None
@@ -126,6 +150,7 @@ async def on_startup() -> None:
 
 app = Litestar(
     route_handlers=[BookController,ReadingLogController],
+    debug=True,
     on_startup = [on_startup],
     plugins=[SQLAlchemyInitPlugin(db_config)],
     openapi_config=OpenAPIConfig(
